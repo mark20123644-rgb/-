@@ -6,14 +6,14 @@ from datetime import datetime
 
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, MenuButtonCommands, BotCommand
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, select
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base
 
 from config import BOT_TOKEN, DATABASE_URL, BOT_USERNAME, hashids, ADMIN_IDS, FEEDBACK_CHANNEL_ID
@@ -38,6 +38,11 @@ class User(Base):
     referrer_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_active = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class WarmingHistory(Base):
+    __tablename__ = "warming_history"
+    id = Column(Integer, primary_key=True, default=1)  # всегда одна запись
+    last_sent = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 async def init_db():
     async with engine.begin() as conn:
@@ -65,11 +70,10 @@ class ThrottlingMiddleware(BaseMiddleware):
 # ---------- КЛАВИАТУРЫ ----------
 def main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-
         [InlineKeyboardButton(text="🔗 Реферальная программа", callback_data="referral")],
         [InlineKeyboardButton(text="🤖 Заказать бота", callback_data="order_bot")],
         [InlineKeyboardButton(text="✍️ Оставить отзыв", callback_data="feedback")],
-        [InlineKeyboardButton(text="💬 Написать создателю", url=f"https://t.me/Mark212935")],
+        [InlineKeyboardButton(text="💬 Написать создателю", url="https://t.me/Mark212935")],
     ])
 
 def back_keyboard():
@@ -110,13 +114,11 @@ async def start_command(message: Message):
         referrer_id = decode_referral_code(args[1])
 
     async with AsyncSessionLocal() as session:
-        # Проверяем, есть ли пользователь в базе
         stmt = select(User).where(User.telegram_id == message.from_user.id)
         result = await session.execute(stmt)
         user = result.scalar_one_or_none()
 
         if user is None:
-            # Новый пользователь — создаём
             user = User(
                 telegram_id=message.from_user.id,
                 username=message.from_user.username,
@@ -125,18 +127,17 @@ async def start_command(message: Message):
             )
             session.add(user)
         else:
-            # Существующий — обновляем данные и активность
             user.username = message.from_user.username
             user.full_name = message.from_user.full_name
             user.last_active = datetime.utcnow()
-            # referrer_id не меняем при повторном /start
 
         await session.commit()
 
     await message.answer(
-    f"👋 Привет, {message.from_user.full_name}!\n\nGitHub бота: https://github.com/mark20123644-rgb/-.git\nВыберите действие:",
-    reply_markup=main_menu_keyboard()
-)
+        f"👋 Привет, {message.from_user.full_name}!\n\nGitHub бота: https://github.com/mark20123644-rgb/-.git\nВыберите действие:",
+        reply_markup=main_menu_keyboard()
+    )
+
 @dp.message(Command("broadcast"))
 async def broadcast_command(message: Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -173,7 +174,7 @@ async def reply_command(message: Message):
     text = args[2]
     user_id = None
     if target.startswith('@'):
-        username = target[1:]  # убираем @
+        username = target[1:]
         async with AsyncSessionLocal() as session:
             result = await session.execute(select(User).where(User.username == username))
             user = result.scalar_one_or_none()
@@ -226,44 +227,60 @@ async def order_bot_start(callback: CallbackQuery, state: FSMContext):
 @dp.message(FeedbackStates.waiting_for_feedback)
 async def process_feedback(message: Message, state: FSMContext):
     feedback_text = message.text
-    # Отправляем отзыв администраторам
     for admin_id in ADMIN_IDS:
         try:
             await message.bot.send_message(admin_id, f"Новый отзыв от {message.from_user.full_name} (@{message.from_user.username}):\n{feedback_text}")
-        except Exception as e:
-            print(f"Не удалось отправить отзыв админу {admin_id}: {e}")
-    # Отправляем в канал обратной связи, если указан
+        except Exception:
+            pass
     if FEEDBACK_CHANNEL_ID:
         try:
             await message.bot.send_message(FEEDBACK_CHANNEL_ID, f"Новый отзыв от {message.from_user.full_name} (@{message.from_user.username}):\n{feedback_text}")
-        except Exception as e:
-            print(f"Не удалось отправить в канал: {e}")
+        except Exception:
+            pass
     await message.answer("Спасибо за ваш отзыв! Он отправлен администраторам.")
     await state.clear()
 
 @dp.message(FeedbackStates.waiting_for_order)
 async def process_order(message: Message, state: FSMContext):
     order_text = message.text
-    # Отправляем заказ администраторам
     for admin_id in ADMIN_IDS:
         try:
             await message.bot.send_message(admin_id, f"Новый заказ на бота от {message.from_user.full_name} (@{message.from_user.username}):\n{order_text}")
-        except Exception as e:
-            print(f"Не удалось отправить заказ админу {admin_id}: {e}")
+        except Exception:
+            pass
     await message.answer("Спасибо! Ваш заказ отправлен создателю. Ожидайте ответа.")
     await state.clear()
 
-async def warming_scheduler(bot: Bot):
+# ---------- ФОНТОВАЯ ЗАДАЧА ПРОГРЕВА (с хранением даты в БД) ----------
+async def check_and_send_warming(bot: Bot):
     while True:
-        await asyncio.sleep(86400 * 30)   # 30 дней
         async with AsyncSessionLocal() as session:
-            result = await session.execute(select(User).where(User.subscribed_warming == True))
-            users = result.scalars().all()
-            for user in users:
-                try:
-                    await bot.send_message(user.telegram_id, "🔥 Ежедневный прогрев: Не забудьте воспользоваться ботом!")
-                except Exception:
-                    pass
+            # Получаем запись истории (id=1)
+            stmt = select(WarmingHistory).where(WarmingHistory.id == 1)
+            history = await session.execute(stmt)
+            row = history.scalar_one_or_none()
+            now = datetime.utcnow()
+            if row is None:
+                # Первый запуск — создаём запись с текущим временем (отправлять не нужно)
+                row = WarmingHistory(id=1, last_sent=now)
+                session.add(row)
+                await session.commit()
+            else:
+                delta = now - row.last_sent
+                if delta.days >= 30:
+                    # Отправляем всем пользователям
+                    users_res = await session.execute(select(User).where(User.subscribed_warming == True))
+                    users = users_res.scalars().all()
+                    for user in users:
+                        try:
+                            await bot.send_message(user.telegram_id, "🔥 Ежемесячный прогрев: Не забудьте воспользоваться ботом!")
+                        except Exception:
+                            pass
+                    # Обновляем дату последней отправки
+                    row.last_sent = now
+                    await session.commit()
+        # Ждём 24 часа до следующей проверки
+        await asyncio.sleep(86400)
 
 # ---------- ЗАПУСК ----------
 async def main():
@@ -271,14 +288,13 @@ async def main():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp.message.middleware(ThrottlingMiddleware(rate_limit=0.7))
     dp.callback_query.middleware(ThrottlingMiddleware(rate_limit=0.7))
-    # Устанавливаем команды меню
     commands = [
         BotCommand(command="start", description="Запустить бота"),
         BotCommand(command="broadcast", description="Рассылка (только админ)"),
         BotCommand(command="reply", description="Ответить пользователю (только админ)"),
     ]
     await bot.set_my_commands(commands)
-    asyncio.create_task(warming_scheduler(bot))
+    asyncio.create_task(check_and_send_warming(bot))
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
