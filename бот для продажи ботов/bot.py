@@ -134,10 +134,9 @@ async def start_command(message: Message):
         await session.commit()
 
     await message.answer(
-        f"👋 Привет, {message.from_user.full_name}!\nВыберите действие:",
-        reply_markup=main_menu_keyboard()
-    )
-
+    f"👋 Привет, {message.from_user.full_name}!\n\nGitHub бота: https://github.com/mark20123644-rgb/-.git\nВыберите действие:",
+    reply_markup=main_menu_keyboard()
+)
 @dp.message(Command("broadcast"))
 async def broadcast_command(message: Message):
     if message.from_user.id not in ADMIN_IDS:
