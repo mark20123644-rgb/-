@@ -256,7 +256,7 @@ async def process_order(message: Message, state: FSMContext):
 
 async def warming_scheduler(bot: Bot):
     while True:
-        await asyncio.sleep(86400)
+        await asyncio.sleep(86400 * 30)   # 30 дней
         async with AsyncSessionLocal() as session:
             result = await session.execute(select(User).where(User.subscribed_warming == True))
             users = result.scalars().all()
